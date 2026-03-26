@@ -129,78 +129,94 @@ async def fetch_tutorial(input_dict: dict) -> str:
 async def run_agent(
     user_message: str,
     history: list[dict],
-    max_loops: int = 5,
+    max_loops: int = 3,
 ) -> str:
     """
-    Run the agent loop: call MiniMax, detect tool calls, execute,
-    feed results back, repeat until done.
+    Run the agent: first call with tutorial knowledge.
+    Only loop for tools if user explicitly asks for live search.
     """
     api_key = get_api_key()
     if not api_key:
         return "⚠️ API Key 未設定，請聯絡站長。"
 
-    # Build conversation with tool-aware system prompt
     system_prompt = build_system_prompt()
 
-    # Recent history (last 10 turns)
-    recent = history[-20:] if len(history) > 20 else history
-    messages = [{"role": "user", "content": [{"type": "text", "text": user_message}]}]
-
-    # Inject tool result history
-    tool_turns = []
+    # Build message history
+    recent = history[-10:] if len(history) > 10 else history
+    messages = []
     for turn in recent:
-        if turn.get("role") == "user" and str(turn.get("content", "")).startswith("[TOOL_RESULT]"):
-            tool_turns.append({
-                "role": "user",
-                "content": [{"type": "text", "text": turn["content"]}],
-            })
+        if turn.get("role") == "user":
+            content = str(turn.get("content", ""))
+            # Skip tool result markers from previous calls
+            if content.startswith("[TOOL_RESULT]"):
+                continue
+            messages.append({"role": "user", "content": [{"type": "text", "text": content}]})
+        elif turn.get("role") == "assistant":
+            messages.append({"role": "assistant", "content": [{"type": "text", "text": str(turn.get("content", ""))}]})
 
-    # Prepend tool results
-    if tool_turns:
-        messages = tool_turns + messages
+    messages.append({"role": "user", "content": [{"type": "text", "text": user_message}]})
 
-    loop_count = 0
-    full_text_parts = []
+    # ── First call: use tutorial knowledge ─────────────────
+    response_text = await call_minimax(api_key, system_prompt, messages)
+    if not response_text:
+        return "⚠️ 無法取得回應，請稍後再試。"
 
-    while loop_count < max_loops:
-        loop_count += 1
+    # Check if user explicitly wants live search
+    live_keywords = ["搜", "查", "最新", "最近", "2024", "2025", "2026", "更新"]
+    wants_live = any(k in user_message for k in live_keywords)
 
+    # Detect tool calls
+    tool_calls = parse_tool_calls(response_text)
+
+    # Only loop for tools if: (a) user asked for live info, or (b) model emitted tool calls
+    if not tool_calls or not (wants_live or tool_calls):
+        return strip_tool_markers(response_text).strip()
+
+    # ── Tool loop (only for explicit live search) ───────────
+    if wants_live and not tool_calls:
+        # User wants live but no tools called → do web search automatically
+        query = user_message
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            result = await web_search({"query": query})
+        messages.append({"role": "assistant", "content": [{"type": "text", "text": response_text}]})
+        messages.append({"role": "user", "content": [{"type": "text", "text": f"[TOOL_RESULT]{{\"name\": \"web_search\", \"content\": \"{result}\"}}"}]})
         response_text = await call_minimax(api_key, system_prompt, messages)
-        if not response_text:
-            return "⚠️ 無法取得回應，請稍後再試。"
+        return strip_tool_markers(response_text).strip()
 
-        # Detect tool call blocks
-        tool_calls = parse_tool_calls(response_text)
+    # Tool calls present → execute and continue
+    loop_count = 0
+    full_text_parts = [strip_tool_markers(response_text)]
+    messages.append({"role": "assistant", "content": [{"type": "text", "text": response_text}]})
 
-        if not tool_calls:
-            # No more tools → final response
-            clean = strip_tool_markers(response_text)
-            full_text_parts.append(clean)
-            return "\n\n".join(full_text_parts).strip()
-
-        # Strip tool markers before appending to display (tools execute silently)
-        clean = strip_tool_markers(response_text)
-        if clean.strip():
-            full_text_parts.append(clean)
+    while loop_count < max_loops and tool_calls:
+        loop_count += 1
 
         # Execute all tools in parallel
         async with httpx.AsyncClient(timeout=30.0) as client:
             tasks = [execute_tool(client, tc) for tc in tool_calls]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Build tool result messages
         for tc, result in zip(tool_calls, results):
-            if isinstance(result, Exception):
-                result_str = f"工具執行錯誤：{result}"
-            else:
-                result_str = result
+            result_str = str(result) if isinstance(result, Exception) else result
             messages.append({
                 "role": "user",
-                "content": [{"type": "text", "text": f"[TOOL_RESULT]{json.dumps({'name': tc['name'], 'tool_call_id': tc['id'], 'content': result_str}, ensure_ascii=False)}"}],
+                "content": [{"type": "text", "text": f"[TOOL_RESULT]{{\"name\": \"{tc['name']}\", \"tool_call_id\": \"{tc['id']}\", \"content\": \"{result_str}\"}}"}],
             })
 
-    return "\n\n".join(full_text_parts).strip() + "\n\n⚠️ 工具執行次數過多，已停止。"
+        # Next call
+        response_text = await call_minimax(api_key, system_prompt, messages)
+        messages.append({"role": "assistant", "content": [{"type": "text", "text": response_text}]})
+        tool_calls = parse_tool_calls(response_text)
 
+        if not tool_calls:
+            full_text_parts.append(strip_tool_markers(response_text))
+            break
+
+        full_text_parts.append(strip_tool_markers(response_text))
+
+    return "\n\n".join(full_text_parts).strip()
+
+        # Detect tool call blocks
 # ── MiniMax API Call ───────────────────────────────────
 MINIMAX_ENDPOINT = "https://api.minimax.io/anthropic/v1/messages"
 MINIMAX_MODEL = "MiniMax-M2.5"
@@ -208,7 +224,7 @@ MINIMAX_MODEL = "MiniMax-M2.5"
 async def call_minimax(api_key: str, system: str, messages: list[dict]) -> str:
     payload = {
         "model": MINIMAX_MODEL,
-        "max_tokens": 1024,
+        "max_tokens": 2048,
         "messages": messages,
         "system": [{"type": "text", "text": system}],
     }
@@ -268,35 +284,50 @@ async def execute_tool(client: httpx.AsyncClient, tool_call: dict) -> str:
 
 # ── System Prompt Builder ──────────────────────────────
 def build_system_prompt() -> str:
+    # Read tutorial content to embed as knowledge base
+    tutorial_path = os.path.join(
+        os.path.dirname(__file__), "..", "openclaw", "tutorial.html"
+    )
+    tutorial_text = ""
+    if os.path.exists(tutorial_path):
+        with open(tutorial_path, encoding="utf-8") as f:
+            html = f.read()
+        # Strip HTML tags to get plain text
+        tutorial_text = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL)
+        tutorial_text = re.sub(r'<style[^>]*>.*?</style>', '', tutorial_text, flags=re.DOTALL)
+        tutorial_text = re.sub(r'<[^>]+>', ' ', tutorial_text)
+        tutorial_text = re.sub(r'\s+', ' ', tutorial_text).strip()
+        # Take first 8000 chars (roughly covers all key tutorial content)
+        tutorial_text = tutorial_text[:8000]
+
     tool_list = "\n".join(
         f'- `{name}`: {fn.__doc__ or ""}'
         for name, fn in TOOLS.items()
     )
-    return f"""你是 OpenClaw 安裝助教，可以回答關於 OpenClaw 安裝、設定、使用的問題。
+    return f"""你是 OpenClaw 安裝助教，**用以下教學文件內容回答問題**。
 
-你擁有以下工具。**當使用者問的問題涉及你不知道的內容時，主動使用工具搜尋資料再回答。**
+## 教學文件知識庫（回答時以此為準，**不要自行臆測**）
 
-可用工具：
+{tutorial_text}
+
+## 可用工具（用於查網路最新資料，不要臆測）
+
 {tool_list}
 
-重要原則：
-- 優先使用 fetch_tutorial 回答教學內容相關問題
-- 涉及 OpenClaw 官網文件時使用 fetch_docs
-- 涉及最新資訊、安裝疑難排解、上網搜尋時使用 web_search
-- **不要猜測**，遇到不確定的資訊就用工具確認
-- 回答時 Markdown 格式（## 標題、**粗體**、`程式碼`、表格）
-- 表格用標準 Markdown 語法（| col | col |）
-
-工具呼叫格式（**嚴格遵守**）：
+## 工具呼叫格式（嚴格遵守）
 ```
 [TOOL_CALL]
-{{"name": "工具名稱", "id": "call_1", "input": {{"參數": "值"}}}}
+{{"name": "工具名", "id": "call_1", "input": {{"參數": "值"}}}}
 [/TOOL_CALL]
 ```
 
-**每次最多呼叫 2 個工具**，不要一口氣呼叫 3 個以上。
-
-如果不需要工具，直接回答即可，不要輸出 [TOOL_CALL] 區塊。"""
+## 回答原則
+- **嚴格根據上方教學文件內容回答**，不要摻雜自己的猜測
+- 教學文件沒有的內容 → 用 web_search 搜尋
+- OpenClaw 官網細節 → 用 fetch_docs
+- **不要臆測 Step/指令/URL**，有疑慮就用工具查
+- 回覆格式：Markdown（## 標題、**粗體**、`程式碼`、表格）
+- 表格語法：| 欄1 | 欄2 |"""
 
 # ── API Key ────────────────────────────────────────────
 def get_api_key() -> Optional[str]:

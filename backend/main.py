@@ -116,8 +116,8 @@ async def serve_tutorial():
       <button id="chat-send" class="chat-send">送出</button>
     </div>
   </div>
-<script src="/shared/marked.min.js"></script>
-<script src="/shared/chat.js"></script>
+<script src="/shared/marked.min.js?v=6"></script>
+<script src="/shared/chat.js?v=6"></script>
 <script>initChat({{ accentColor: '#c0392b', welcomeMsg: '👋 嗨！我是 OpenClaw 安裝助教。\\n有什麼關於安裝或設定的問題，歡迎問我！' }});</script>
 </body>
 </html>"""
