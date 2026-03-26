@@ -1,8 +1,8 @@
 """
-FastAPI backend for OpenClaw Tutorial Chatbot.
+FastAPI backend for OpenClaw Tutorial — split panel with integrated chat.
 Serves:
-  - GET  /           → tutorial.html (the chat-enabled page)
-  - POST /api/chat  → { message, history } → { response }
+  - GET /  → tutorial page (left) + chat panel (right 30%)
+  - POST /api/chat → { message, history } → { response }
 """
 
 import os
@@ -16,7 +16,7 @@ from typing import Optional
 from chatbot import chat
 
 # ── App ────────────────────────────────────────────────────────────────
-app = FastAPI(title="OpenClaw Tutorial Chatbot")
+app = FastAPI(title="OpenClaw Tutorial")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,8 +27,8 @@ app.add_middleware(
 
 BASE = Path(__file__).parent
 TUTORIAL_HTML = BASE.parent / "openclaw" / "tutorial.html"
-CHAT_WIDGET_CSS = BASE / "chat-widget.css"
-CHAT_WIDGET_JS = BASE / "chat-widget.js"
+CHAT_CSS = BASE / "chat-widget.css"
+CHAT_JS  = BASE / "chat-widget.js"
 
 # ── API Models ──────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
@@ -39,7 +39,7 @@ class ChatResponse(BaseModel):
     response: str
     error: Optional[str] = None
 
-# ── API Routes ─────────────────────────────────────────────────────────
+# ── Routes ─────────────────────────────────────────────────────────────
 @app.post("/api/chat", response_model=ChatResponse)
 async def api_chat(req: ChatRequest):
     result = await chat(req.message, req.history)
@@ -49,51 +49,64 @@ async def api_chat(req: ChatRequest):
 async def health():
     return {"status": "ok"}
 
-# ── Serve tutorial.html with chat widget injected ──────────────────────
 @app.get("/")
 async def serve_tutorial():
-    """Serve tutorial.html with chat widget injected into the page."""
+    """Split-panel layout: tutorial left (70%) + chat right (30%)."""
     if not TUTORIAL_HTML.exists():
         return JSONResponse(status_code=404, content={"error": "tutorial.html not found"})
 
-    html = TUTORIAL_HTML.read_text(encoding="utf-8")
+    tutorial_html = TUTORIAL_HTML.read_text(encoding="utf-8")
+    css = CHAT_CSS.read_text(encoding="utf-8") if CHAT_CSS.exists() else ""
+    js  = CHAT_JS.read_text(encoding="utf-8")  if CHAT_JS.exists()  else ""
 
-    # Inject CSS
-    css = CHAT_WIDGET_CSS.read_text(encoding="utf-8") if CHAT_WIDGET_CSS.exists() else ""
-    css_tag = f"<style>\n{css}\n</style>"
+    # Strip tutorial.html's own <head> and <body> wrapper tags to extract inner content
+    # Remove doctype, html, head, body tags
+    inner = tutorial_html
+    for tag in ("<!DOCTYPE html>", "<html lang=\"zh-TW\">", "</html>",
+                "<head>", "</head>", "<body>", "</body>"):
+        inner = inner.replace(tag, "")
 
-    # Inject JS
-    js = CHAT_WIDGET_JS.read_text(encoding="utf-8") if CHAT_WIDGET_JS.exists() else ""
-    js_tag = f"<script>\n{js}\n</script>"
-
-    # Inject into <head> (before </head>)
-    if "</head>" in html:
-        html = html.replace("</head>", f"{css_tag}\n</head>")
-    else:
-        html = css_tag + html
-
-    # Inject chat widget + JS before </body>
-    widget_html = """
-<!-- Chat Widget -->
-<div id="chat-launcher" title="OpenClaw 安裝助教">💬</div>
-<div id="chat-window">
-  <div id="chat-header">
-    <span>🦞 OpenClaw 安裝助教</span>
-    <button id="chat-close">✕</button>
+    # Inject our layout: CSS in <head>, tutorial in left panel, chat in right
+    panel_html = f"""<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+/* Inherited tutorial styles (no reset — preserve page styles) */
+{css}
+</style>
+</head>
+<body>
+  <!-- Tutorial content (left 70%) -->
+  <div class="tutorial-panel">
+{inner}
   </div>
-  <div id="chat-messages"></div>
-  <div id="chat-input-area">
-    <input id="chat-input" type="text" placeholder="問我關於 OpenClaw 安裝的問題…" autocomplete="off" />
-    <button id="chat-send">送出</button>
-  </div>
-</div>
-"""
-    if "</body>" in html:
-        html = html.replace("</body>", f"{widget_html}{js_tag}\n</body>")
-    else:
-        html += f"{widget_html}{js_tag}"
 
-    return HTMLResponse(content=html, media_type="text/html; charset=utf-8")
+  <!-- Chat panel (right 30%) -->
+  <div class="chat-panel">
+    <div class="chat-panel-header">
+      <span class="header-icon">🦞</span>
+      <span>OpenClaw 安裝助教</span>
+      <span class="header-sub">AI 客服</span>
+    </div>
+    <div id="chat-messages" class="chat-messages"></div>
+    <div class="chat-input-area">
+      <input id="chat-input" class="chat-input"
+             type="text"
+             placeholder="問我關於 OpenClaw 安裝的問題…"
+             autocomplete="off" />
+      <button id="chat-send" class="chat-send">送出</button>
+    </div>
+  </div>
+
+<script>
+{js}
+</script>
+</body>
+</html>"""
+
+    return HTMLResponse(content=panel_html, media_type="text/html; charset=utf-8")
 
 # ── Run ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
